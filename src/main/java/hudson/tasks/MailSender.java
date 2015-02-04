@@ -31,24 +31,24 @@ import hudson.model.*;
 import hudson.scm.ChangeLogSet;
 import hudson.tasks.i18n.Messages;
 import jenkins.model.Jenkins;
+import jenkins.plugins.mailer.tasks.MailAddressFilter;
+import jenkins.plugins.mailer.tasks.MimeMessageBuilder;
 
 import javax.mail.Address;
-import javax.mail.Message;
 import javax.mail.MessagingException;
 import javax.mail.Transport;
 import javax.mail.internet.InternetAddress;
 import javax.mail.internet.MimeMessage;
 import javax.mail.internet.AddressException;
 
-import org.apache.commons.lang.StringUtils;
-
 import java.io.File;
 import java.io.IOException;
 import java.io.UnsupportedEncodingException;
+import java.lang.reflect.Method;
 import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import jenkins.model.JenkinsLocationConfiguration;
+import javax.annotation.CheckForNull;
 
 /**
  * Core logic of sending out notification e-mail.
@@ -96,13 +96,19 @@ public class MailSender {
         this.includeUpstreamCommitters.addAll(includeUpstreamCommitters);
     }
 
+    @Deprecated
     public boolean execute(AbstractBuild<?, ?> build, BuildListener listener) throws InterruptedException {
+        run(build, listener);
+        return true;
+    }
+
+    public final void run(Run<?,?> build, TaskListener listener) throws InterruptedException {
         try {
-            MimeMessage mail = getMail(build, listener);
+            MimeMessage mail = createMail(build, listener);
             if (mail != null) {
                 // if the previous e-mail was sent for a success, this new e-mail
                 // is not a follow up
-                AbstractBuild<?, ?> pb = build.getPreviousBuild();
+                Run<?, ?> pb = build.getPreviousBuild();
                 if(pb!=null && pb.getResult()==Result.SUCCESS) {
                     mail.removeHeader("In-Reply-To");
                     mail.removeHeader("References");
@@ -111,8 +117,11 @@ public class MailSender {
                 Address[] allRecipients = mail.getAllRecipients();
                 if (allRecipients != null) {
                     StringBuilder buf = new StringBuilder("Sending e-mails to:");
-                    for (Address a : allRecipients)
-                        buf.append(' ').append(a);
+                    for (Address a : allRecipients) {
+                        if (a!=null) {
+                            buf.append(' ').append(a);
+                        }
+                    }
                     listener.getLogger().println(buf);
                     Transport.send(mail);
 
@@ -126,8 +135,6 @@ public class MailSender {
         } catch (UnsupportedEncodingException e) {
             e.printStackTrace(listener.error(e.getMessage()));
         }
-
-        return true;
     }
 
     /**
@@ -138,7 +145,7 @@ public class MailSender {
      * <p>
      * And since we are consulting the earlier result, if the previous build is still running, behave as if this were the first build.
      */
-    private Result findPreviousBuildResult(AbstractBuild<?,?> b) throws InterruptedException {
+    private Result findPreviousBuildResult(Run<?,?> b) throws InterruptedException {
         do {
             b=b.getPreviousBuild();
             if (b == null || b.isBuilding()) {
@@ -148,7 +155,25 @@ public class MailSender {
         return b.getResult();
     }
 
+    @Deprecated
     protected MimeMessage getMail(AbstractBuild<?, ?> build, BuildListener listener) throws MessagingException, UnsupportedEncodingException, InterruptedException {
+        return createMail(build, listener);
+    }
+
+    protected @CheckForNull MimeMessage createMail(Run<?,?> build, TaskListener listener) throws MessagingException, UnsupportedEncodingException, InterruptedException {
+        // In case getMail was overridden elsewhere. Cannot use Util.isOverridden since it only works on public methods.
+        try {
+            Method m = getClass().getDeclaredMethod("getMail", AbstractBuild.class, BuildListener.class);
+            if (m.getDeclaringClass() != MailSender.class) { // so, overridden
+                if (build instanceof AbstractBuild && listener instanceof BuildListener) {
+                    return getMail((AbstractBuild) build, (BuildListener) listener);
+                } else {
+                    throw new AbstractMethodError("you must override createMail rather than getMail");
+                }
+            } // else using MailSender itself (or overridden in an intermediate superclass, too obscure to check)
+        } catch (NoSuchMethodException x) {
+            // non-deprecated subclass
+        }
         if (build.getResult() == Result.FAILURE) {
             return createFailureMail(build, listener);
         }
@@ -172,7 +197,7 @@ public class MailSender {
         return null;
     }
 
-    private MimeMessage createBackToNormalMail(AbstractBuild<?, ?> build, String subject, BuildListener listener) throws MessagingException, UnsupportedEncodingException {
+    private MimeMessage createBackToNormalMail(Run<?, ?> build, String subject, TaskListener listener) throws MessagingException, UnsupportedEncodingException {
         MimeMessage msg = createEmptyMail(build, listener);
 
         msg.setSubject(getSubject(build, Messages.MailSender_BackToNormalMail_Subject(subject)),charset);
@@ -183,12 +208,21 @@ public class MailSender {
         return msg;
     }
 
-    private MimeMessage createUnstableMail(AbstractBuild<?, ?> build, BuildListener listener) throws MessagingException, UnsupportedEncodingException {
+    private static ChangeLogSet<? extends ChangeLogSet.Entry> getChangeSet(Run<?,?> build) {
+        if (build instanceof AbstractBuild) {
+            return ((AbstractBuild<?,?>) build).getChangeSet();
+        } else {
+            // TODO JENKINS-24141 call getChangeSets in general
+            return ChangeLogSet.createEmpty(build);
+        }
+    }
+
+    private MimeMessage createUnstableMail(Run<?, ?> build, TaskListener listener) throws MessagingException, UnsupportedEncodingException {
         MimeMessage msg = createEmptyMail(build, listener);
 
         String subject = Messages.MailSender_UnstableMail_Subject();
 
-        AbstractBuild<?, ?> prev = build.getPreviousBuild();
+        Run<?, ?> prev = build.getPreviousBuild();
         boolean still = false;
         if(prev!=null) {
             if(prev.getResult()==Result.SUCCESS)
@@ -202,8 +236,8 @@ public class MailSender {
         msg.setSubject(getSubject(build, subject),charset);
         StringBuilder buf = new StringBuilder();
         // Link to project changes summary for "still unstable" if this or last build has changes
-        if (still && !(build.getChangeSet().isEmptySet() && prev.getChangeSet().isEmptySet()))
-            appendUrl(Util.encode(build.getProject().getUrl()) + "changes", buf);
+        if (still && !(getChangeSet(build).isEmptySet() && getChangeSet(prev).isEmptySet()))
+            appendUrl(Util.encode(build.getParent().getUrl()) + "changes", buf);
         else
             appendBuildUrl(build, buf);
         msg.setText(buf.toString(), charset);
@@ -211,9 +245,9 @@ public class MailSender {
         return msg;
     }
 
-    private void appendBuildUrl(AbstractBuild<?, ?> build, StringBuilder buf) {
+    private void appendBuildUrl(Run<?, ?> build, StringBuilder buf) {
         appendUrl(Util.encode(build.getUrl())
-                  + (build.getChangeSet().isEmptySet() ? "" : "changes"), buf);
+                  + (getChangeSet(build).isEmptySet() ? "" : "changes"), buf);
     }
 
     private void appendUrl(String url, StringBuilder buf) {
@@ -222,7 +256,7 @@ public class MailSender {
             buf.append(Messages.MailSender_Link(baseUrl, url)).append("\n\n");
     }
 
-    private MimeMessage createFailureMail(AbstractBuild<?, ?> build, BuildListener listener) throws MessagingException, UnsupportedEncodingException, InterruptedException {
+    private MimeMessage createFailureMail(Run<?, ?> build, TaskListener listener) throws MessagingException, UnsupportedEncodingException, InterruptedException {
         MimeMessage msg = createEmptyMail(build, listener);
 
         msg.setSubject(getSubject(build, Messages.MailSender_FailureMail_Subject()),charset);
@@ -231,7 +265,7 @@ public class MailSender {
         appendBuildUrl(build, buf);
 
         boolean firstChange = true;
-        for (ChangeLogSet.Entry entry : build.getChangeSet()) {
+        for (ChangeLogSet.Entry entry : getChangeSet(build)) {
             if (firstChange) {
                 firstChange = false;
                 buf.append(Messages.MailSender_FailureMail_Changes()).append("\n\n");
@@ -263,9 +297,9 @@ public class MailSender {
                 // Hyperlink local file paths to the repository workspace or build artifacts.
                 // Note that it is possible for a failure mail to refer to a file using a workspace
                 // URL which has already been corrected in a subsequent build. To fix, archive.
-                workspaceUrl = baseUrl + Util.encode(build.getProject().getUrl()) + "ws/";
+                workspaceUrl = baseUrl + Util.encode(build.getParent().getUrl()) + "ws/";
                 artifactUrl = baseUrl + Util.encode(build.getUrl()) + "artifact/";
-                FilePath ws = build.getWorkspace();
+                FilePath ws = build instanceof AbstractBuild ? ((AbstractBuild) build).getWorkspace() : null;
                 // Match either file or URL patterns, i.e. either
                 // c:\hudson\workdir\jobs\foo\workspace\src\Foo.java
                 // file:/c:/hudson/workdir/jobs/foo/workspace/src/Foo.java
@@ -286,7 +320,7 @@ public class MailSender {
                     int pos = 0;
                     while (m.find(pos)) {
                         String path = m.group(2).replace(File.separatorChar, '/');
-                        String linkUrl = artifactMatches(path, build) ? artifactUrl : workspaceUrl;
+                        String linkUrl = artifactMatches(path, (AbstractBuild) build) ? artifactUrl : workspaceUrl;
                         String prefix = line.substring(0, m.start()) + '<' + linkUrl + Util.encode(path) + '>';
                         pos = prefix.length();
                         line = prefix + line.substring(m.end());
@@ -307,120 +341,119 @@ public class MailSender {
         return msg;
     }
 
-    private MimeMessage createEmptyMail(AbstractBuild<?, ?> build, BuildListener listener) throws MessagingException, UnsupportedEncodingException {
-        MimeMessage msg = new MimeMessage(Mailer.descriptor().createSession());
+    private MimeMessage createEmptyMail(final Run<?, ?> build, final TaskListener listener) throws MessagingException, UnsupportedEncodingException {
+        MimeMessageBuilder messageBuilder = new MimeMessageBuilder()
+                .setCharset(charset)
+                .setListener(listener);
+
         // TODO: I'd like to put the URL to the page in here,
         // but how do I obtain that?
-        msg.addHeader("X-Jenkins-Job", build.getProject().getDisplayName());
-        msg.addHeader("X-Jenkins-Result", build.getResult().toString());
-        msg.setContent("", "text/plain");
-        msg.setFrom(Mailer.StringToAddress(JenkinsLocationConfiguration.get().getAdminAddress(), charset));
-        msg.setSentDate(new Date());
-        
-        String replyTo = Mailer.descriptor().getReplyToAddress();
-        if (StringUtils.isNotBlank(replyTo)) {
-            msg.setReplyTo(new Address[]{Mailer.StringToAddress(replyTo, charset)});
-        }
 
-        Set<InternetAddress> rcp = new LinkedHashSet<InternetAddress>();
-        String defaultSuffix = Mailer.descriptor().getDefaultSuffix();
         StringTokenizer tokens = new StringTokenizer(recipients);
         while (tokens.hasMoreTokens()) {
             String address = tokens.nextToken();
-            if(address.startsWith("upstream-individuals:")) {
+            if (build instanceof AbstractBuild && address.startsWith("upstream-individuals:")) {
                 // people who made a change in the upstream
                 String projectName = address.substring("upstream-individuals:".length());
-                AbstractProject up = Jenkins.getInstance().getItem(projectName,build.getProject(),AbstractProject.class);
+                AbstractProject up = Jenkins.getInstance().getItem(projectName, build.getParent(), AbstractProject.class);
                 if(up==null) {
                     listener.getLogger().println("No such project exist: "+projectName);
                     continue;
                 }
-                includeCulpritsOf(up, build, listener, rcp);
+                messageBuilder.addRecipients(getCulpritsOfEmailList(up, (AbstractBuild) build, listener));
             } else {
                 // ordinary address
-            	
-            	// if not a valid address (i.e. no '@'), then try adding suffix
-            	if (!address.contains("@") && defaultSuffix != null && defaultSuffix.contains("@")) {
-            		address += defaultSuffix;
-            	}
-            	
-                try {
-                    rcp.add(Mailer.StringToAddress(address, charset));
-                } catch (AddressException e) {
-                    // report bad address, but try to send to other addresses
-                    listener.getLogger().println("Unable to send to address: " + address);
-                    e.printStackTrace(listener.error(e.getMessage()));
-                }
+                messageBuilder.addRecipients(address);
             }
         }
 
         for (AbstractProject project : includeUpstreamCommitters) {
-            includeCulpritsOf(project, build, listener, rcp);
+            messageBuilder.addRecipients(getCulpritsOfEmailList(project, (AbstractBuild) build, listener));
         }
 
-        if (sendToIndividuals) {
-            Set<User> culprits = build.getCulprits();
+        if (sendToIndividuals && build instanceof AbstractBuild) {
+            Set<User> culprits = ((AbstractBuild) build).getCulprits();
 
             if(debug)
                 listener.getLogger().println("Trying to send e-mails to individuals who broke the build. sizeof(culprits)=="+culprits.size());
 
-            rcp.addAll(buildCulpritList(listener,culprits));
+            messageBuilder.addRecipients(getUserEmailList(listener, culprits));
         }
-        msg.setRecipients(Message.RecipientType.TO, rcp.toArray(new InternetAddress[rcp.size()]));
+        
+        // set recipients after filtering out recipients that should not receive emails
+        messageBuilder.setRecipientFilter(new MimeMessageBuilder.AddressFilter() {
+            @Override
+            public Set<InternetAddress> apply(Set<InternetAddress> recipients) {
+                return MailAddressFilter.filterRecipients(build, listener, recipients);
+            }
+        });
 
-        AbstractBuild<?, ?> pb = build.getPreviousBuild();
+        MimeMessage msg = messageBuilder.buildMimeMessage();
+
+        msg.addHeader("X-Jenkins-Job", build.getParent().getFullName());
+        msg.addHeader("X-Jenkins-Result", build.getResult().toString());
+
+        Run<?, ?> pb = build.getPreviousBuild();
         if(pb!=null) {
             MailMessageIdAction b = pb.getAction(MailMessageIdAction.class);
             if(b!=null) {
-                msg.setHeader("In-Reply-To",b.messageId);
-                msg.setHeader("References",b.messageId);
+                MimeMessageBuilder.setInReplyTo(msg, b.messageId);
             }
         }
 
         return msg;
     }
 
-    void includeCulpritsOf(AbstractProject upstreamProject, AbstractBuild<?, ?> currentBuild, BuildListener listener, Set<InternetAddress> recipientList) throws AddressException, UnsupportedEncodingException {
+    String getCulpritsOfEmailList(AbstractProject upstreamProject, AbstractBuild<?, ?> currentBuild, TaskListener listener) throws AddressException, UnsupportedEncodingException {
         AbstractBuild<?,?> upstreamBuild = currentBuild.getUpstreamRelationshipBuild(upstreamProject);
         AbstractBuild<?,?> previousBuild = currentBuild.getPreviousBuild();
         AbstractBuild<?,?> previousBuildUpstreamBuild = previousBuild!=null ? previousBuild.getUpstreamRelationshipBuild(upstreamProject) : null;
         if(previousBuild==null && upstreamBuild==null && previousBuildUpstreamBuild==null) {
             listener.getLogger().println("Unable to compute the changesets in "+ upstreamProject +". Is the fingerprint configured?");
-            return;
+            return null;
         }
         if(previousBuild==null || upstreamBuild==null || previousBuildUpstreamBuild==null) {
             listener.getLogger().println("Unable to compute the changesets in "+ upstreamProject);
-            return;
+            return null;
         }
         AbstractBuild<?,?> b=previousBuildUpstreamBuild;
+
+        StringBuilder culpritEmails = new StringBuilder();
         do {
             b = b.getNextBuild();
             if (b != null) {
-                recipientList.addAll(buildCulpritList(listener,b.getCulprits()));
+                String userEmails = getUserEmailList(listener, b.getCulprits());
+                if (userEmails != null) {
+                    if (culpritEmails.length() > 0) {
+                        culpritEmails.append(",");
+                    }
+                    culpritEmails.append(userEmails);
+                }
             }
         } while ( b != upstreamBuild && b != null );
+
+        return culpritEmails.toString();
     }
 
-    private Set<InternetAddress> buildCulpritList(BuildListener listener, Set<User> culprits) throws AddressException, UnsupportedEncodingException {
-        Set<InternetAddress> r = new HashSet<InternetAddress>();
-        for (User a : culprits) {
+    private String getUserEmailList(TaskListener listener, Set<User> users) throws AddressException, UnsupportedEncodingException {
+        StringBuilder userEmails = new StringBuilder();
+        for (User a : users) {
             String adrs = Util.fixEmpty(a.getProperty(Mailer.UserProperty.class).getAddress());
             if(debug)
                 listener.getLogger().println("  User "+a.getId()+" -> "+adrs);
-            if (adrs != null)
-            	try {
-                r.add(Mailer.StringToAddress(adrs, charset));
-                } catch(AddressException e) {
-                    listener.getLogger().println("Invalid address: " + adrs);
+            if (adrs != null) {
+                if (userEmails.length() > 0) {
+                    userEmails.append(",");
                 }
-            else {
+                userEmails.append(adrs);
+            } else {
                 listener.getLogger().println(Messages.MailSender_NoAddress(a.getFullName()));
             }
         }
-        return r;
+        return userEmails.toString();
     }
 
-    private String getSubject(AbstractBuild<?, ?> build, String caption) {
+    private String getSubject(Run<?, ?> build, String caption) {
         return caption + ' ' + build.getFullDisplayName();
     }
 

@@ -28,13 +28,15 @@ import static hudson.Util.fixEmptyAndTrim;
 
 import hudson.EnvVars;
 import hudson.Extension;
+import hudson.FilePath;
 import hudson.Functions;
 import hudson.Launcher;
 import hudson.RestrictedSince;
 import hudson.Util;
 import hudson.model.AbstractBuild;
 import hudson.model.AbstractProject;
-import hudson.model.BuildListener;
+import hudson.model.Run;
+import hudson.model.TaskListener;
 import hudson.model.User;
 import hudson.model.UserPropertyDescriptor;
 import hudson.tasks.i18n.Messages;
@@ -78,6 +80,7 @@ import org.kohsuke.stapler.StaplerRequest;
 import org.kohsuke.stapler.export.Exported;
 
 import jenkins.model.Jenkins;
+import jenkins.tasks.SimpleBuildStep;
 import net.sf.json.JSONObject;
 
 /**
@@ -85,7 +88,7 @@ import net.sf.json.JSONObject;
  *
  * @author Kohsuke Kawaguchi
  */
-public class Mailer extends Notifier {
+public class Mailer extends Notifier implements SimpleBuildStep {
     protected static final Logger LOGGER = Logger.getLogger(Mailer.class.getName());
 
     /**
@@ -128,17 +131,19 @@ public class Mailer extends Notifier {
     }
 
     @Override
-    public boolean perform(AbstractBuild<?,?> build, Launcher launcher, BuildListener listener) throws IOException, InterruptedException {
+    public void perform(Run<?,?> build, FilePath workspace, Launcher launcher, TaskListener listener) throws IOException, InterruptedException {
         if(debug)
             listener.getLogger().println("Running mailer");
         // substitute build parameters
         EnvVars env = build.getEnvironment(listener);
         String recip = env.expand(recipients);
 
-        return new MailSender(recip, dontNotifyEveryUnstableBuild, sendToIndividuals, descriptor().getCharset()) {
+        new MailSender(recip, dontNotifyEveryUnstableBuild, sendToIndividuals, descriptor().getCharset()) {
             /** Check whether a path (/-separated) will be archived. */
             @Override
             public boolean artifactMatches(String path, AbstractBuild<?,?> build) {
+                // TODO a Notifier runs after a Recorder so it would make more sense to just check actual artifacts, not configuration
+                // (Anyway currently this code would only be called for an AbstractBuild, since otherwise we cannot know what hyperlink to use for a random workspace.)
                 ArtifactArchiver aa = build.getProject().getPublishersList().get(ArtifactArchiver.class);
                 if (aa == null) {
                     LOGGER.finer("No ArtifactArchiver found");
@@ -158,7 +163,7 @@ public class Mailer extends Notifier {
                 LOGGER.log(Level.FINER, "DescriptorImpl.artifactMatches for {0} matched none of {1}", new Object[] {path, artifacts});
                 return false;
             }
-        }.execute(build,listener);
+        }.run(build,listener);
     }
 
     /**
@@ -345,7 +350,7 @@ public class Mailer extends Notifier {
             if(json.has("useSMTPAuth")) {
                 JSONObject auth = json.getJSONObject("useSMTPAuth");
                 smtpAuthUsername = nullify(auth.getString("smtpAuthUserName"));
-                smtpAuthPassword = Secret.fromString(nullify(auth.getString("smtpAuthPassword")));
+                smtpAuthPassword = Secret.fromString(nullify(auth.getString("smtpAuthPasswordSecret")));
             } else {
                 smtpAuthUsername = null;
                 smtpAuthPassword = null;
@@ -393,7 +398,11 @@ public class Mailer extends Notifier {
             if (smtpAuthPassword==null) return null;
             return Secret.toString(smtpAuthPassword);
         }
-        
+
+        public Secret getSmtpAuthPasswordSecret() {
+            return smtpAuthPassword;
+        }
+
         public boolean getUseSsl() {
         	return useSsl;
         }
@@ -496,13 +505,16 @@ public class Mailer extends Notifier {
          */
         public FormValidation doSendTestMail(
                 @QueryParameter String smtpServer, @QueryParameter String adminAddress, @QueryParameter boolean useSMTPAuth,
-                @QueryParameter String smtpAuthUserName, @QueryParameter String smtpAuthPassword,
+                @QueryParameter String smtpAuthUserName, @QueryParameter Secret smtpAuthPasswordSecret,
                 @QueryParameter boolean useSsl, @QueryParameter String smtpPort, @QueryParameter String charset,
                 @QueryParameter String sendTestMailTo) throws IOException, ServletException, InterruptedException {
             try {
-                if (!useSMTPAuth)   smtpAuthUserName = smtpAuthPassword = null;
+                if (!useSMTPAuth) {
+                    smtpAuthUserName = null;
+                    smtpAuthPasswordSecret = null;
+                }
                 
-                MimeMessage msg = new MimeMessage(createSession(smtpServer,smtpPort,useSsl,smtpAuthUserName,Secret.fromString(smtpAuthPassword)));
+                MimeMessage msg = new MimeMessage(createSession(smtpServer, smtpPort, useSsl, smtpAuthUserName, smtpAuthPasswordSecret));
                 msg.setSubject(Messages.Mailer_TestMail_Subject(++testEmailCount), charset);
                 msg.setText(Messages.Mailer_TestMail_Content(testEmailCount, Jenkins.getInstance().getDisplayName()), charset);
                 msg.setFrom(StringToAddress(adminAddress, charset));
