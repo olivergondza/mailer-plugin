@@ -161,7 +161,7 @@ public class MimeMessageBuilder {
 
         setJenkinsInstanceIdent(msg);
 
-        msg.setContent("", mimeType);
+        msg.setContent("", contentType());
         if (StringUtils.isNotBlank(from)) {
             msg.setFrom(toNormalizedAddress(from));
         }
@@ -212,10 +212,14 @@ public class MimeMessageBuilder {
             Multipart multipart = new MimeMultipart();
             BodyPart bodyPart = new MimeBodyPart();
 
-            bodyPart.setContent(body, mimeType);
+            bodyPart.setContent(body, contentType());
             multipart.addBodyPart(bodyPart);
             msg.setContent(multipart);
         }
+    }
+
+    private String contentType() {
+        return String.format("%s; charset=%s", mimeType, charset);
     }
 
     private void addRecipients(MimeMessage msg) throws UnsupportedEncodingException, MessagingException {
